@@ -1,10 +1,11 @@
-use nix::libc::{intptr_t, sbrk};
+use nix::libc::sbrk;
 
-use parking_lot::Mutex;
+use spin::Mutex;
 use std::alloc::{AllocError, Allocator as AllocatorTrait, GlobalAlloc, Layout};
+use std::mem::{align_of, size_of};
+use std::process::abort;
 
-
-use std::ptr::{null_mut, NonNull};
+use std::ptr::{NonNull, null_mut};
 
 pub struct Allocator {
     allocator_impl: Mutex<AllocatorImpl>,
@@ -20,7 +21,9 @@ impl Allocator {
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocator_impl.lock().allocate(layout)
+        let alloca = self.allocator_impl.lock().allocate(layout);
+        assert!(alloca.is_aligned());
+        alloca
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
@@ -30,7 +33,8 @@ unsafe impl GlobalAlloc for Allocator {
 
 unsafe impl AllocatorTrait for Allocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = unsafe { self.allocator_impl.lock().allocate(layout) };
+        let ptr = self.allocator_impl.lock().allocate(layout);
+        assert!(ptr.is_aligned());
         if ptr.is_null() {
             Err(AllocError {})
         } else {
@@ -51,86 +55,147 @@ struct AllocatorImpl {
     head: Block,
 }
 
+unsafe impl Send for Block {}
+unsafe impl Sync for Block {}
+
 impl AllocatorImpl {
-    const DUMMY_BLOCK: Block = Block {
-        data: 0 as *mut u8,
+    const BLOCK0: Block = Block {
+        data: NonNull::dangling().as_ptr(),
         size: 0,
         next: None,
         free: false,
     };
 
     pub const fn new() -> Self {
-        Self {
-            head: Self::DUMMY_BLOCK,
-        }
+        Self { head: Self::BLOCK0 }
     }
 
-    pub unsafe fn allocate(&mut self, layout: Layout) -> *mut u8 {
-        assert_ne!(layout.size(), 0, "zero sized allocation is UB!");
+    pub fn allocate(&mut self, layout: Layout) -> *mut u8 {
+        let previous_break = unsafe { sbrk(0) } as usize;
+        let block_addr = align_up(previous_break, align_of::<Block>());
+        let alloc_sz = align_up(block_addr + size_of::<Block>(), layout.align()) + layout.size();
 
-        let last_block = match self.head.find_with_size(layout.size()) {
-            Ok(block) => return block.data,
-            Err(block) => block,
-        };
+        let block = self
+            .head
+            .find_first_fit(alloc_sz);
+        if let Some(block) = block {
+            return block.data;
+        }
 
-        let extended_layout = layout
-            .extend(Layout::for_value(&Self::DUMMY_BLOCK))
-            .unwrap()
-            .0
-            .pad_to_align();
-
-        let block_addr = sbrk(
-            (extended_layout.size() + extended_layout.padding_needed_for(layout.align()))
-                as intptr_t,
-        );
-        if block_addr.is_null() || block_addr as intptr_t == -1 {
+        let new_brk = unsafe { sbrk((alloc_sz - previous_break) as isize) };
+        if new_brk.is_null() {
             return null_mut();
         }
 
-        let block = &mut *(block_addr as *mut Block);
-        block.data = block_addr.offset(1) as *mut u8;
-        block.size = layout.size();
-        block.free = false;
-        block.next = None;
-        last_block.next = Some(block_addr as *mut Block);
+        let new_block_addr = align_up(new_brk as usize, align_of::<Block>());
+        let mut new_block = NonNull::new(new_block_addr as *mut Block).unwrap();
+        let data = align_up(new_block_addr + size_of::<Block>(), layout.align()) as *mut u8;
+        unsafe {
+            new_block.as_mut().size = layout.size();
+            new_block.as_mut().next = None;
+            new_block.as_mut().data = data;
+            new_block.as_mut().free = false;
+        }
+        self.head.insert(new_block);
 
-        block.data
+        data
     }
-    pub fn deallocate(&mut self, ptr: *mut u8) {
-        // TODO: do not leak memory
-        self.head.find_by_ptr(ptr).map(|block| block.free = true);
+
+    pub unsafe fn deallocate(&mut self, ptr: *mut u8) {
+        let block = self.head.find_by_ptr(ptr);
+        if let Some(block) = block {
+            if block.free {
+                eprintln!("double free: {:?}", ptr);
+                abort();
+            }
+            block.free = true;
+
+            // collect all consecutive free blocks
+            if let Some(ref mut final_block) = block.next {
+                let mut final_block = final_block.as_mut();
+                loop {
+                    match final_block.next {
+                        Some(ref mut next) => {
+                            block.next = next.as_ref().next;
+                            if unsafe { next.as_ref() }.free {
+                                final_block = next.as_mut();
+                            } else {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+
+                if final_block != block {
+                    block.size += (final_block.data as usize + final_block.size) - block.data as usize;
+                }
+            }
+        }
+    }
+
+    pub fn dump_blocks(&self) {
+        let mut current_block = &self.head;
+        let mut i = 1;
+
+        loop {
+            println!("|-------- Block #{i} --------|");
+            println!("|- data: {:?}", current_block.data);
+            println!("|- size: {:?}", current_block.size);
+            println!("|- free: {:?}", current_block.free);
+            println!("|- next: {:?}\n", current_block.next);
+            match current_block.next {
+                Some(ref next) => current_block = unsafe { next.as_ref() },
+                None => break,
+            }
+            i += 1;
+        }
     }
 }
 
+#[derive(PartialOrd, PartialEq)]
 struct Block {
     data: *mut u8,
     size: usize,
+    next: Option<NonNull<Block>>,
     free: bool,
-    next: Option<*mut Block>,
 }
 
-unsafe impl Send for Block {}
-
 impl Block {
-    fn find_with_size(&mut self, size: usize) -> Result<&mut Self, &mut Self> {
-        if self.size == size && self.free {
-            Ok(self)
-        } else if let Some(next) = self.next {
-            // Safety: The allocator ensures that the next block's
-            //         address is valid.
-            unsafe { next.as_mut() }.unwrap().find_with_size(size)
+    fn find_first_fit(&mut self, size: usize) -> Option<&Block> {
+        if self.size >= size && self.free {
+            Some(self)
         } else {
-            Err(self)
+            match self.next {
+                // SAFETY: block.next is a valid pointer to an instance of Block.
+                Some(ref mut next) => unsafe { next.as_mut() }.find_first_fit(size),
+                None => None,
+            }
         }
     }
 
-    fn find_by_ptr(&mut self, ptr: *mut u8) -> Option<&mut Self> {
-        if self as *mut Block as *mut u8 == ptr {
+    fn find_by_ptr(&mut self, ptr: *mut u8) -> Option<&mut Block> {
+        if self.data == ptr {
             Some(self)
-        } else if let Some(next) = self.next {
-            unsafe { &mut *next }.find_by_ptr(ptr)
         } else {
-            None
+            match self.next {
+                // SAFETY: block.next is a valid pointer to an instance of Block.
+                Some(ref mut next) => unsafe { next.as_mut() }.find_by_ptr(ptr),
+                None => None,
+            }
         }
     }
+
+    fn insert(&mut self, block: NonNull<Block>) {
+        match self.next {
+            // SAFETY: block.next is a valid pointer to an instance of Block.
+            Some(ref mut next) => unsafe { next.as_mut() }.insert(block),
+            None => self.next = Some(block),
+        }
+    }
+}
+
+fn align_up(addr: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two());
+    (addr + align - 1) & !(align - 1)
 }

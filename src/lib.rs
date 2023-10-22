@@ -1,5 +1,6 @@
 #![feature(allocator_api)]
-#![feature(nonnull_slice_from_raw_parts)]
 #![feature(alloc_layout_extra)]
-pub mod allocator;
+#![feature(pointer_is_aligned)]
+#![feature(pointer_byte_offsets)]
 
+pub mod allocator;
